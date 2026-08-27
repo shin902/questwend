@@ -9,6 +9,8 @@
 // 2x2 spatial merge -> 2-layer GELU MLP projector -> n_image_tokens (576)
 // embeddings of size projection_dim (= LLM n_embd).
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
