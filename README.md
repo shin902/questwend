@@ -275,7 +275,7 @@ Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s
 | `--time-slice <N>` | interleave concurrent streams every N generated tokens (default 64; effective with `--cache-slots`. `0` serializes completely = throughput first) |
 | `--cpu` | force the CPU backend |
 | `--resident-decode` and friends | offload tuning knobs (`--resident-refill/-warmup`, `--prefill-prune`, `--batch-chunk`, `--ssd-direct`; shared with the CLI, see the offloading section above) |
-| `--pf-chunk <N>` | server prefill slice length (disconnect-detection granularity; default 4096) |
+| `--pf-chunk <N>` | resident/build-graph prefill slice (server disconnect-detection granularity; default 512) |
 
 > `max_tokens` is optional: when it is omitted (or <= 0) generation runs until the context is
 > exhausted, matching llama.cpp's server — set a budget only when you want one. `finish_reason` is
@@ -391,8 +391,7 @@ Not normally needed — for profiling, A/B checks and troubleshooting.
 | `QWEN_SSD_DIRECT=1` | = `--ssd-direct` (Windows: unbuffered reads bypassing the page cache) |
 | `QWEN_COALESCE=1` | merge a layer's expert union into large sequential range reads (for drives where sequential beats random QD8) |
 | `QWEN_COAL_DEBUG=1` | print per-run read/upload times for coalesced reads |
-| `QWEN_PF_CHUNK=N` | = `--pf-chunk` (server prefill slice length; default 4096) |
-| `QWEN_PREFILL_CHUNK=N` | chunk length for resident / RAM-tier build_graph prefill (default 512) |
+| `QWEN_PREFILL_CHUNK=N` | = server `--pf-chunk`; resident / RAM-tier build_graph prefill chunk length (default 512) |
 | `QWEN_CPU_PREFILL=1` | revert RAM-tier prefill to running experts on CPU (scheduler). The old behavior: the GPU idles but H2D transfers are avoided |
 | `QWEN_MTP_NO_BATCH_PREFILL=1` | revert MTP prefill to token-by-token (default is batched; forced batched with image input) |
 | `QWEN_FASTCACHE=1` | optimistic single-graph decode (assumes all experts resident, falls back on a miss; `--resident-decode` without the mask) |

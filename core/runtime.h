@@ -170,8 +170,9 @@ public:
     CacheStats cache_stats() const;
     bool has_expert_cache() const;
 
-    // Progress callback invoked once per prefill chunk (offload path only;
-    // resident prefill is a single fast pass): (tokens_done, tokens_total).
+    // Progress callback invoked once per internally chunked prefill. Resident
+    // prefill chunks according to QWEN_PREFILL_CHUNK; the server primarily uses
+    // this for offload progress.
     void set_progress_cb(std::function<void(int, int)> cb);
 
     // Tokens currently represented in the KV cache / recurrent state, in order.

@@ -567,7 +567,7 @@ int main(int argc, char ** argv) {
         else if (a == "--resident-warmup" && i + 1 < argc) set_knob("QWEN_RESIDENT_WARMUP", argv[++i]);
         else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", argv[++i]);
         else if (a == "--batch-chunk" && i + 1 < argc)     set_knob("QWEN_BATCH_CHUNK", argv[++i]);
-        else if (a == "--pf-chunk" && i + 1 < argc)        set_knob("QWEN_PF_CHUNK", argv[++i]);
+        else if (a == "--pf-chunk" && i + 1 < argc)        set_knob("QWEN_PREFILL_CHUNK", argv[++i]);
         else if (a == "--ssd-direct")       set_knob("QWEN_SSD_DIRECT", "1");
         else if (a == "-h" || a == "--help") want_help = true;
         else {
@@ -634,8 +634,10 @@ int main(int argc, char ** argv) {
             "                      (prefill always uses the whole pool as one LRU stream)\n"
             "  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n"
             "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
-            "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"
-            "  --pf-chunk <N>      server prefill slice (disconnect-abort granularity, default 4096)\n"
+            "  --batch-chunk <N>   offloaded prefill chunk length (default 4096)\n"
+            "                      (expert-cache path; does not affect resident prefill)\n"
+            "  --pf-chunk <N>      resident/build-graph prefill slice (default 512)\n"
+            "                      (also bounds server disconnect-abort granularity)\n"
             "  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n"
             "  -h, --help          show this help and exit\n", argv[0]);
         return want_help ? 0 : 1;
@@ -1651,17 +1653,17 @@ int main(int argc, char ** argv) {
                         // prefill slice unit: token slices would be too fine (batch
                         // efficiency), so prefill works in coarser chunks; a client
                         // disconnect / a yield to a queued request happens between
-                        // chunks instead of after the whole prefill. With expert
-                        // offload, per-chunk expert fetch is amortized over the chunk
-                        // (layer-major prefill), so bigger chunks = less streaming:
-                        // 4096 by default, QWEN_PF_CHUNK / --pf-chunk to tune.
-                        // Deliberately NOT tied to --time-slice: shrinking prefill
-                        // chunks to the slice length would destroy the layer-major
-                        // fetch amortization on the offload tiers.
-                        static const size_t pf_chunk = []{
-                            const char * c = getenv("QWEN_PF_CHUNK");
+                        // chunks instead of after the whole prefill. Resident graphs
+                        // use QWEN_PREFILL_CHUNK / --pf-chunk (512 by default), while
+                        // the expert-cache path uses QWEN_BATCH_CHUNK (4096 by
+                        // default). Keep the outer server loop on the same knob as
+                        // Runtime::decode(): otherwise it would silently override
+                        // the expert-cache batching choice.
+                        const size_t pf_chunk = [&] {
+                            const bool expert_cache = rt->has_expert_cache();
+                            const char * c = getenv(expert_cache ? "QWEN_BATCH_CHUNK" : "QWEN_PREFILL_CHUNK");
                             const int v = c ? atoi(c) : 0;
-                            return (size_t) (v >= 1 ? v : 4096);
+                            return (size_t) (v >= 1 ? v : (expert_cache ? 4096 : 512));
                         }();
 
                         // ---- MTP self-speculative decode: one time slice per provider

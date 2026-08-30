@@ -142,7 +142,8 @@ static void usage(const char * prog) {
     printf("                      (prefill always uses the whole pool as one LRU stream)\n");
     printf("  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n");
     printf("  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n");
-    printf("  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n");
+    printf("  --batch-chunk <N>   offloaded prefill chunk length (default 4096)\n");
+    printf("                      (expert-cache path; resident prefill uses QWEN_PREFILL_CHUNK)\n");
     printf("  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n");
 #ifdef _WIN32
     printf("  --bench-read <file> raw unbuffered read benchmark (sequential head/tail + random) and exit\n");
