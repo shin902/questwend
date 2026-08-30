@@ -1751,7 +1751,10 @@ ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf
     dbg("pooled", pooled);
     dbg("q", q);
     dbg("bias", expanded);
-    ggml_tensor * top_k = ggml_cont(ctx, ggml_top_k(ctx, expanded, width));  // [width, T]
+    // Vulkan's TOP_K kernel only has pipelines for K <= 1024. QSA's
+    // Flash-Next budget is 2048 + r - 1, so use the existing argsort path
+    // here; its large-input workspace is bounded by the padded input width.
+    ggml_tensor * top_k = ggml_cont(ctx, ggml_argsort_top_k(ctx, expanded, width));  // [width, T]
     dbg("topk", top_k);
 
     // Unmask exactly the selected cells: start from all -inf and scatter zeros

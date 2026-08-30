@@ -68,6 +68,14 @@ target_link_libraries(qw-cli PRIVATE questwend_core)
 add_executable(qw-tokenize tests/tokenize_main.cpp)
 target_link_libraries(qw-tokenize PRIVATE questwend_core)
 
+# ---- QSA top-k shape regression test ----
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(qw-qsa-topk tests/qsa_topk.cpp)
+    target_link_libraries(qw-qsa-topk PRIVATE ggml)
+    add_test(NAME qsa_topk_shape COMMAND qw-qsa-topk)
+endif()
+
 # ---- Server (OpenAI-compatible) ----
 add_executable(qw-server server/main.cpp third_party/cpp-httplib/httplib.cpp)
 target_include_directories(qw-server PRIVATE
