@@ -483,7 +483,7 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
-        else if (a == "--pf-chunk" && i + 1 < argc)  set_knob("QWEN_PF_CHUNK", argv[++i]);
+        else if (a == "--pf-chunk" && i + 1 < argc)  set_knob("QWEN_PREFILL_CHUNK", argv[++i]);
         else if (a == "-h" || a == "--help") want_help = true;
         else {
             const ArgResult r = parse_common_arg(argc, argv, i, opt);
@@ -524,7 +524,8 @@ int main(int argc, char ** argv) {
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
             "                      (default 64; takes effect with --cache-slots; 0 = run back-to-back)\n"
             "  --heartbeat <on|off>  SSE keepalive chunks while queued / between prefill chunks (default on)\n"
-            "  --pf-chunk <N>      server prefill slice (disconnect-abort granularity, default 4096)\n"
+            "  --pf-chunk <N>      resident/build-graph prefill slice (default 512)\n"
+            "                      (also bounds server disconnect-abort granularity)\n"
             "  -h, --help          show this help and exit\n", argv[0]);
         // --reasoning and --repeat-penalty are per-request overrides here
         // ("reasoning" / "repeat_penalty" in the body); the flags set the default.
@@ -1519,17 +1520,17 @@ int main(int argc, char ** argv) {
                         // prefill slice unit: token slices would be too fine (batch
                         // efficiency), so prefill works in coarser chunks; a client
                         // disconnect / a yield to a queued request happens between
-                        // chunks instead of after the whole prefill. With expert
-                        // offload, per-chunk expert fetch is amortized over the chunk
-                        // (layer-major prefill), so bigger chunks = less streaming:
-                        // 4096 by default, QWEN_PF_CHUNK / --pf-chunk to tune.
-                        // Deliberately NOT tied to --time-slice: shrinking prefill
-                        // chunks to the slice length would destroy the layer-major
-                        // fetch amortization on the offload tiers.
-                        static const size_t pf_chunk = []{
-                            const char * c = getenv("QWEN_PF_CHUNK");
+                        // chunks instead of after the whole prefill. Resident graphs
+                        // use QWEN_PREFILL_CHUNK / --pf-chunk (512 by default), while
+                        // the expert-cache path uses QWEN_BATCH_CHUNK (4096 by
+                        // default). Keep the outer server loop on the same knob as
+                        // Runtime::decode(): otherwise it would silently override
+                        // the expert-cache batching choice.
+                        const size_t pf_chunk = [&] {
+                            const bool expert_cache = rt->has_expert_cache();
+                            const char * c = getenv(expert_cache ? "QWEN_BATCH_CHUNK" : "QWEN_PREFILL_CHUNK");
                             const int v = c ? atoi(c) : 0;
-                            return (size_t) (v >= 1 ? v : 4096);
+                            return (size_t) (v >= 1 ? v : (expert_cache ? 4096 : 512));
                         }();
 
                         // ---- MTP self-speculative decode: one time slice per provider

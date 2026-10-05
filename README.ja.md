@@ -282,7 +282,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 | `--time-slice <N>` | 同時ストリーミングを N 生成トークンごとに交互実行（既定 64。`--cache-slots` があるときに有効。`0` で完全直列＝性能優先） |
 | `--cpu` | CPU バックエンドを強制 |
 | `--resident-decode` ほか | オフロード調整ノブ（`--resident-refill/-warmup`, `--prefill-prune`, `--batch-chunk`, `--ssd-direct`; CLI と共通、上のオフロード節を参照） |
-| `--pf-chunk <N>` | サーバー prefill のスライス長（切断検出の粒度; 既定 4096） |
+| `--pf-chunk <N>` | 常駐／build_graph prefill のスライス長（サーバー切断検出の粒度; 既定 512） |
 
 > `max_tokens` は省略可。**未指定（または 0 以下）ならコンテキストが尽きるまで生成する**（llama.cpp の
 > サーバーと同じ挙動。上限を掛けたいときだけ指定する）。予算・コンテキストのどちらで打ち切られた場合も
@@ -359,8 +359,7 @@ qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40
 | `QWEN_SSD_DIRECT=1` | = `--ssd-direct`（Windows: unbuffered read でページキャッシュをバイパス） |
 | `QWEN_COALESCE=1` | SSD 読みで層の和集合を大きな連続レンジ読みに合体（シーケンシャルがランダム QD8 より速いドライブ向け） |
 | `QWEN_COAL_DEBUG=1` | 合体読みの run ごとの read/upload 時間を表示 |
-| `QWEN_PF_CHUNK=N` | = `--pf-chunk`（サーバー prefill のスライス長; 既定 4096） |
-| `QWEN_PREFILL_CHUNK=N` | 常駐／RAM階層 build_graph prefill のチャンク長（既定 512） |
+| `QWEN_PREFILL_CHUNK=N` | = サーバー `--pf-chunk`；常駐／RAM階層 build_graph prefill のチャンク長（既定 512） |
 | `QWEN_CPU_PREFILL=1` | RAM 階層の prefill をエキスパート CPU 実行（sched）に戻す（既定は GPU キャッシュ経路。GPU が遊ぶ代わりに H2D 転送を省く旧挙動） |
 | `QWEN_MTP_NO_BATCH_PREFILL=1` | MTP の prefill を旧来の token-by-token に戻す（既定はバッチ。画像入力時はバッチ強制） |
 | `QWEN_FASTCACHE=1` | 楽観単一グラフデコード（全 expert 常駐前提 + ミス時フォールバック; `--resident-decode` のマスク無し版） |

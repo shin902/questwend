@@ -34,8 +34,10 @@ RAM オフロード `--vram-budget 13500`(注: 14000 はデスクトップ常駐
   メモリ上限)。
 - → **層あたり expert fetch はチャンクにつき和集合1回**。expert トラフィックはチャンク数に
   比例し、トークン数に依存しない。decode() の外側チャンク既定を 4096 に(QWEN_BATCH_CHUNK)。
-- server: 非 time-slice 時の prefill チャンク 512→4096(QWEN_PF_CHUNK)。切断検出粒度は
-  ~10s に粗くなるトレードオフ。
+- server: 常駐／build_graph prefill のチャンクは `QWEN_PREFILL_CHUNK`
+  （`--pf-chunk`、既定 512）で指定する。expert-cache オフロード経路ではサーバーの外側も
+  `QWEN_BATCH_CHUNK`（既定 4096）に合わせ、`--pf-chunk` が expert 転送のチャンクを
+  小さくしないようにする。切断検出粒度はチャンクに応じて粗くなるトレードオフ。
 
 結果(出力品質は不変、-n 64 の要約で確認):
 
