@@ -17,6 +17,25 @@
 
 namespace questwend {
 
+void throw_alloc_failure(ggml_backend_buffer_type_t buft, size_t bytes, const std::string & what) {
+    std::string dev = buft ? ggml_backend_buft_name(buft) : "the backend";
+    size_t dev_free = 0, dev_total = 0;
+    if (ggml_backend_dev_t d = buft ? ggml_backend_buft_get_device(buft) : nullptr) {
+        ggml_backend_dev_memory(d, &dev_free, &dev_total);
+        dev = ggml_backend_dev_description(d);
+    }
+    char msg[512];
+    if (dev_total)
+        snprintf(msg, sizeof(msg),
+                 "failed to allocate %zu MB for %s on %s: %zu MB free of %zu MB. "
+                 "Lower --n-ctx, add a device with --gpus, or run on the CPU with --cpu.",
+                 bytes >> 20, what.c_str(), dev.c_str(), dev_free >> 20, dev_total >> 20);
+    else
+        snprintf(msg, sizeof(msg), "failed to allocate %zu MB for %s on %s",
+                 bytes >> 20, what.c_str(), dev.c_str());
+    throw std::runtime_error(msg);
+}
+
 const char * arch_name(Arch a) {
     switch (a) {
         case Arch::QWEN3:     return "qwen3";
@@ -65,6 +84,13 @@ bool Model::is_offloaded_expert(const std::string & name) const {
     return true;
 }
 
+size_t Model::offloaded_expert_bytes() const {
+    size_t n = 0;
+    for (auto & kv : tensors_)
+        if (is_offloaded_expert(kv.first)) n += ggml_nbytes(kv.second);
+    return n;
+}
+
 Model::~Model() {
     if (embd_buf_)    ggml_backend_buffer_free(embd_buf_);
     if (embd_ctx_)    ggml_free(embd_ctx_);
@@ -91,23 +117,38 @@ static bool backend_supports_get_rows(ggml_backend_t backend, const ggml_tensor 
 }
 
 // Quantized token embedding needs a get_rows-friendly copy only when the
-// backend has no native kernel for the stored type.
-static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te) {
+// backend has no native kernel for the stored type. `verbose` is off for the
+// weight_bytes() estimate, which asks the same question before loading and
+// should not narrate the answer a second time.
+static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te,
+                               bool verbose = true) {
     if (!te || te->type == GGML_TYPE_F32 || te->type == GGML_TYPE_F16) return false;
     if (backend_supports_get_rows(backend, te)) {
-        fprintf(stderr, "token_embd: %s natively supported by backend get_rows (no fallback copy)\n",
-                ggml_type_name(te->type));
+        if (verbose)
+            fprintf(stderr, "token_embd: %s natively supported by backend get_rows (no fallback copy)\n",
+                    ggml_type_name(te->type));
         return false;
     }
     return true;
 }
 
+size_t Model::weight_bytes(ggml_backend_t backend) const {
+    size_t n = 0;
+    for (auto & kv : tensors_) n += ggml_nbytes(kv.second);
+    // The get_rows fallback copy is an extra resident tensor, not a replacement:
+    // load_weights_* keeps the quantized original for the output head.
+    ggml_tensor * te = tensor("token_embd.weight");
+    if (backend && need_embd_fallback(backend, te, /*verbose=*/false))
+        n += ggml_row_size(embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, te->ne[0]) * te->ne[1];
+    return n;
+}
+
 ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
     // Allocate one backend buffer holding all weight tensors.
     weights_buf_ = ggml_backend_alloc_ctx_tensors(meta_, backend);
-    if (!weights_buf_) {
-        throw std::runtime_error("failed to allocate weights buffer");
-    }
+    if (!weights_buf_)
+        throw_alloc_failure(ggml_backend_get_default_buffer_type(backend),
+                            weight_bytes(nullptr), "the model weights");
 
     // token embedding for get_rows: dequantize if the stored type has no native
     // get_rows kernel on this backend (K-quants / IQ types on CUDA).
@@ -130,7 +171,9 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
         tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
         ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
         embd_buf_ = ggml_backend_alloc_ctx_tensors(embd_ctx_, backend);
-        if (!embd_buf_) throw std::runtime_error("failed to alloc token embedding fallback");
+        if (!embd_buf_)
+            throw_alloc_failure(ggml_backend_get_default_buffer_type(backend),
+                                ggml_nbytes(tok_embd_rows_), "the token embedding fallback copy");
     }
 
     std::map<std::string, void *> files;
@@ -191,7 +234,7 @@ static void alloc_tensors_chunked(ggml_backend_buffer_type_t buft,
             group_sz += sz;
         }
         ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, group_sz > 0 ? group_sz : 1);
-        if (!b) throw std::runtime_error(std::string("failed to allocate buffer for ") + what);
+        if (!b) throw_alloc_failure(buft, group_sz, what);
         ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         out_bufs.push_back(b);
         struct ggml_tallocr ta = ggml_tallocr_new(b);

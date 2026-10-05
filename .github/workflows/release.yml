@@ -32,16 +32,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # windows-latest is windows-2025-vs2026 now, and CUDA's host_config.h
+          # only accepts Visual Studio 2017..2022 -- nvcc refuses MSVC 14.5x
+          # before it compiles a single line. Pin to the VS 2022 image, which is
+          # also what llama.cpp does for its CUDA release builds. Vulkan and CPU
+          # do not need it, but sharing one MSVC keeps every Windows artifact on
+          # the same VC++ redistributable.
           - name: win-cuda-x64
-            runner: windows-latest
+            runner: windows-2022
             backend: cuda
             flags: -DQW_CUDA=ON
           - name: win-vulkan-x64
-            runner: windows-latest
+            runner: windows-2022
             backend: vulkan
             flags: -DQW_VULKAN=ON
           - name: win-cpu-x64
-            runner: windows-latest
+            runner: windows-2022
             backend: cpu
             flags: ''
 
@@ -81,10 +87,17 @@ jobs:
             flags: -DBUILD_SHARED_LIBS=OFF
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
+      # ccache-action installs ccache with brew on macOS, and the runner image
+      # ships an aws/tap that Homebrew no longer trusts -- every brew command
+      # then prints a wall of trust warnings. We use nothing from that tap.
+      - name: Drop untrusted Homebrew taps
+        if: runner.os == 'macOS'
+        run: brew untap aws/tap || true
 
       - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           key: ${{ matrix.name }}
           max-size: 2G
@@ -192,13 +205,18 @@ jobs:
         run: |
           cuda=$(cygpath -u "$CUDA_PATH")
           mkdir -p dist/cudart-win-x64
-          cp "$cuda"/bin/cudart64_*.dll \
-             "$cuda"/bin/cublas64_*.dll \
-             "$cuda"/bin/cublasLt64_*.dll dist/cudart-win-x64/
+          # CUDA 12 keeps these in bin/, CUDA 13 moved them to bin/x64.
+          for d in "$cuda/bin" "$cuda/bin/x64"; do
+            for f in cudart64_*.dll cublas64_*.dll cublasLt64_*.dll; do
+              cp "$d"/$f dist/cudart-win-x64/ 2>/dev/null || true
+            done
+          done
+          # fail loudly rather than shipping an empty zip
+          ls dist/cudart-win-x64/cudart64_*.dll > /dev/null
           cd dist
           7z a "cudart-win-x64-cu${CUDA_WIN_VERSION}.zip" cudart-win-x64 > /dev/null
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: |
@@ -211,14 +229,46 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      # Assets are listed at the bottom of the release page anyway, but an
+      # explicit table saves people from guessing which of eleven files they
+      # want. generate_release_notes appends the changelog after this, so the
+      # table stays at the top.
+      - name: Compose release body
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          base="${{ github.server_url }}/${{ github.repository }}/releases/download/${tag}"
+          row() { printf '| %s | %s | [`%s`](%s/%s) |\n' "$1" "$2" "$3" "$base" "$3"; }
+          {
+            echo '## Downloads'
+            echo
+            echo '| Platform | Backend | File |'
+            echo '|---|---|---|'
+            row 'Windows x64'        'CUDA'   "questwend-win-cuda-x64-${tag}.zip"
+            row 'Windows x64'        'Vulkan' "questwend-win-vulkan-x64-${tag}.zip"
+            row 'Windows x64'        'CPU'    "questwend-win-cpu-x64-${tag}.zip"
+            row 'Linux x64'          'CUDA'   "questwend-linux-cuda-x64-${tag}.tar.gz"
+            row 'Linux x64'          'Vulkan' "questwend-linux-vulkan-x64-${tag}.tar.gz"
+            row 'Linux x64'          'CPU'    "questwend-linux-cpu-x64-${tag}.tar.gz"
+            row 'Linux arm64 (GB10)' 'CUDA'   "questwend-linux-cuda-arm64-${tag}.tar.gz"
+            row 'Linux arm64'        'CPU'    "questwend-linux-cpu-arm64-${tag}.tar.gz"
+            row 'macOS arm64'        'Metal'  "questwend-macos-metal-arm64-${tag}.tar.gz"
+            row 'macOS arm64'        'CPU'    "questwend-macos-cpu-arm64-${tag}.tar.gz"
+            echo
+            cudart="cudart-win-x64-cu${CUDA_WIN_VERSION}.zip"
+            printf 'The Windows CUDA build needs `cudart` / `cublas` / `cublasLt` alongside it. If you have no CUDA Toolkit installed, unzip [`%s`](%s/%s) into the same directory as `qw-cli.exe`. An NVIDIA driver is required either way.\n' \
+              "$cudart" "$base" "$cudart"
+          } > release-body.md
+          cat release-body.md
+
+      - uses: softprops/action-gh-release@v3
         with:
           name: QuestWend ${{ github.ref_name }}
+          body_path: release-body.md
           # Flip to false once a tag has been through this end to end.
           draft: true
           generate_release_notes: true

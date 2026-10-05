@@ -20,6 +20,13 @@ typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 
 namespace questwend {
 
+// Report a backend allocation failure with the numbers that explain it: what was
+// being allocated, how much it asked for, and what the device says it has. ggml's
+// allocators only return null, and "failed to allocate buffer" on its own leaves
+// exactly the question the reader has unanswered. Always throws.
+[[noreturn]] void throw_alloc_failure(ggml_backend_buffer_type_t buft, size_t bytes,
+                                      const std::string & what);
+
 enum class Arch {
     UNKNOWN,
     QWEN3,        // dense transformer, no GDN
@@ -239,6 +246,17 @@ public:
 
     // Returns true if this model has any routed expert tensors (MoE layers).
     bool has_expert_tensors() const;
+
+    // Bytes the weights occupy once loaded onto `backend`: every tensor, plus
+    // the F16/Q8_0 copy of the token embedding that load_weights_* makes when
+    // the backend has no get_rows kernel for the stored type. Computable from
+    // the metadata alone, so the runtime can ask whether the model fits before
+    // it commits a single byte of it. Depends on set_embd_q8() and, for
+    // offloaded_expert_bytes(), on set_keep_nextn_resident().
+    size_t weight_bytes(ggml_backend_t backend) const;
+    // The part of that total held by routed experts, i.e. what the SSD and RAM
+    // tiers take out of VRAM.
+    size_t offloaded_expert_bytes() const;
 
     // Returns true if the tensor name belongs to a routed expert (not shared expert).
     static bool is_expert_tensor(const std::string & name);
