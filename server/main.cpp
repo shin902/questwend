@@ -10,6 +10,7 @@
 #include "chat.h"
 #include "vision.h"
 #include "args.h"
+#include "batch_executor.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -469,6 +470,7 @@ int main(int argc, char ** argv) {
     std::string host = "127.0.0.1";
     bool no_mmproj = false;
     int  cache_slots = 0;
+    int  batch_slots = 0;
     std::string cache_slots_dir;
     int  time_slice = 64;   // generation tokens per turn when requests contend
                             // (needs --cache-slots to park state; 0 = back-to-back)
@@ -480,6 +482,7 @@ int main(int argc, char ** argv) {
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
         else if (a == "--no-mmproj")        no_mmproj = true;
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
+        else if (a == "--batch-slots" && i + 1 < argc) batch_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
@@ -499,6 +502,17 @@ int main(int argc, char ** argv) {
     }
     if (!want_help && !validate_common_options(opt)) return 1;
     if (!cache_slots_dir.empty() && cache_slots <= 0) cache_slots = 4;   // dir implies slots
+    if (batch_slots < 0 || batch_slots > 4) {
+        fprintf(stderr, "--batch-slots must be 0..4\n");
+        return 1;
+    }
+    if (batch_slots > 0) {
+        if (opt.use_mtp || !no_mmproj || !cache_slots_dir.empty()) {
+            fprintf(stderr, "--batch-slots requires --no-mmproj, no --mtp and no disk cache slots\n");
+            return 1;
+        }
+        cache_slots = 0;
+    }
 
     // Mirrors of the common options the request handlers below capture by value.
     const std::string & model_path = opt.model_path;
@@ -520,6 +534,8 @@ int main(int argc, char ** argv) {
             "  --host <addr>       bind address (default 127.0.0.1)\n"
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
+            "  --batch-slots <N>   experimental resident text AR batching, 1..4 active slots\n"
+            "                      (requires --no-mmproj; no prefix reuse or MTP)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
             "                      (default 64; takes effect with --cache-slots; 0 = run back-to-back)\n"
@@ -536,6 +552,7 @@ int main(int argc, char ** argv) {
     std::unique_ptr<Model> model;
     std::unique_ptr<Tokenizer> tok;
     std::unique_ptr<Runtime> rt;
+    std::unique_ptr<BatchExecutor> batch;
     ggml_backend_t vis_backend = nullptr;
     std::unique_ptr<VisionEncoder> venc;
     std::mutex vis_mtx;   // the encoder graph is single-threaded
@@ -599,6 +616,12 @@ int main(int argc, char ** argv) {
         if (!apply_common_options(opt, cfg)) return 1;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
         rt = std::make_unique<Runtime>(*model, cfg);
+        if (batch_slots > 0) {
+            const char * knob = getenv("QWEN_PREFILL_CHUNK");
+            const int chunk = knob ? atoi(knob) : 512;
+            if (chunk < 1) throw std::runtime_error("batch prefill chunk must be positive");
+            batch = std::make_unique<BatchExecutor>(*rt, batch_slots, chunk, time_slice);
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "load error: %s\n", e.what());
         return 1;
@@ -664,7 +687,7 @@ int main(int argc, char ** argv) {
     TicketLock tlock;          // runtime is single-threaded + stateful (FIFO queue)
     uint64_t live_owner = 0;   // request id owning the live state (0 = none); guarded by tlock
     std::atomic<uint64_t> sid_gen{1};
-    if (time_slice > 0 && cache_slots <= 0)
+    if (!batch && time_slice > 0 && cache_slots <= 0)
         fprintf(stderr, "warning: --time-slice without --cache-slots: a preempted request"
                         " re-prefills its whole context on resume\n");
 
@@ -1189,6 +1212,7 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!images.empty()) {
+                if (batch) throw std::runtime_error("image input is not supported in batch mode");
                 if (!venc) throw std::runtime_error("image input not available (no mmproj loaded)");
                 copts.n_image_tokens = venc->n_image_tokens();
                 copts.add_vision_id  = images.size() > 1;
@@ -1225,6 +1249,8 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> prompt = cp.ids;
         const int n_prompt_full = (int) prompt.size();
         const bool req_mtp = mtp;
+        const bool batch_greedy = sc.temperature <= 0 && (sc.repeat_last_n <= 0 ||
+                (sc.repeat_penalty == 1 && sc.presence_penalty == 0 && sc.frequency_penalty == 0));
 
         // arrival log: the "req:" line below only appears once the runtime is
         // acquired, which can be minutes later behind a running request
@@ -1252,6 +1278,9 @@ int main(int argc, char ** argv) {
                 bool holding = false;             // we own the runtime lock
                 std::vector<int32_t> prompt;
                 std::vector<float> logits;
+                std::shared_ptr<BatchExecutor::Lease> lease;
+                int batch_past = 0;
+                int32_t greedy_token = -1;
                 std::string text;   // accumulated output (for tool-call parsing)
                 std::string utf8_pend;            // incomplete UTF-8 tail held between chunks
                 // output routing: reasoning -> reasoning_content deltas until
@@ -1318,8 +1347,20 @@ int main(int argc, char ** argv) {
             st->smp.prime(prompt);   // repetition-penalty window (prompt tail)
 
             res.set_chunked_content_provider("text/event-stream",
-                [&, st, id, created, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
+                [&, st, id, created, req_mtp, n_draft, batch_greedy](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
+                    auto past = [&] { return batch ? st->batch_past : rt->n_past(); };
+                    auto decode_tokens = [&](const std::vector<int32_t> & tokens) {
+                        if (!batch) return std::vector<float>(rt->decode(tokens));
+                        std::function<bool()> keep_running;
+                        if (tokens.size() > 1) keep_running = [&] {
+                            return sink.is_writable() && (!hb_on || sink.write(st->hb.data(), st->hb.size()));
+                        };
+                        auto output = batch->decode(*st->lease, tokens, batch_greedy, keep_running);
+                        st->batch_past = output.n_past;
+                        st->greedy_token = output.greedy_token;
+                        return std::move(output.logits);
+                    };
                     auto finish = [&]() -> bool {
                         if (st->holding) { tlock.unlock(); st->holding = false; }
                         const auto t_end = clk::now();
@@ -1376,7 +1417,7 @@ int main(int argc, char ** argv) {
                         // parsed) -> clients retry/extend instead of treating a
                         // partial reply as complete.
                         const bool truncated = calls.empty() &&
-                            (st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx);
+                            (st->generated >= st->max_tokens || past() + 1 >= n_ctx);
                         const char * fr = truncated ? "length" : "stop";
                         if (!calls.empty()) {
                             json tcs = json::array();
@@ -1403,6 +1444,7 @@ int main(int argc, char ** argv) {
                         ev += "data: " + dumpj(fin) + "\n\ndata: [DONE]\n\n";
                         sink.write(ev.data(), ev.size());
                         st->finished = true;
+                        st->lease.reset();
                         sink.done();
                         return false;
                     };
@@ -1477,7 +1519,15 @@ int main(int argc, char ** argv) {
                     };
                     try {
                         const bool was_holding = st->holding;
-                        if (!st->holding) {
+                        if (batch && !st->lease) {
+                            while (!(st->lease = batch->acquire_for(std::chrono::milliseconds(100)))) {
+                                if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
+                                    st->finished = true;
+                                    return false;
+                                }
+                            }
+                        }
+                        if (!batch && !st->holding) {
                             // Waiting for the runtime can take minutes behind a long
                             // request. An SSE stream that stays byte-silent that long
                             // gets killed by client body-idle timeouts (Node/undici
@@ -1499,7 +1549,7 @@ int main(int argc, char ** argv) {
                             }
                             st->holding = true;
                         }
-                        if (!was_holding) {
+                        if (!batch && !was_holding) {
                             st->slice_used = 0;   // fresh slice on (re)acquisition
                             *cur_prog = st->prog; // progress lines report this request
                         }
@@ -1611,14 +1661,11 @@ int main(int argc, char ** argv) {
                                 ++st->n_sent; ++st->slice_used;
                                 if (++st->generated >= st->max_tokens) return finish();
                             }
+                            int32_t resume_token = -1;
                             if (st->pending_valid) {
-                                const int32_t t = st->pending;
+                                resume_token = st->pending;
                                 st->pending_valid = false;
-                                if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return finish();
-                                if (!emit_piece(t)) return finish();
-                                ++st->n_sent; ++st->slice_used;
-                                if (++st->generated >= st->max_tokens) return finish();
-                                rp.push_back(t);                        // decode it as the tail
+                                if (is_stop(resume_token) || rt->n_past() + 1 >= n_ctx) return finish();
                             } else if (st->started && rp.empty()) {
                                 return finish();                        // nothing to resume from
                             }
@@ -1641,7 +1688,7 @@ int main(int argc, char ** argv) {
                                 ++st->slice_used; ++st->n_sent;
                                 st->generated++;
                                 return st->generated < st->max_tokens;
-                            }, &pending, ckpt);
+                            }, &pending, ckpt, resume_token);
 
                             if (st->paused && !st->done) {              // yield the runtime
                                 st->pending = pending;
@@ -1662,10 +1709,10 @@ int main(int argc, char ** argv) {
                             st->started = true;
                             st->t0 = clk::now();
                             st->had_images = !st->ovr.empty();
-                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
+                            st->n_cached = batch ? 0 : prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
                             st->cstat0 = rt->cache_stats();
                             st->my_imgs = *kv_imgs;
-                        } else if (!was_holding) {
+                        } else if (!batch && !was_holding) {
                             // resumed after yielding the runtime at a slice boundary
                             bool reprefill = false;
                             if (!ensure_state(st->sid, st->my_toks, st->my_imgs, st->had_images, reprefill)) {
@@ -1681,22 +1728,25 @@ int main(int argc, char ** argv) {
                             if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
                                 fprintf(stderr, "[%s] client gone during prefill (%zu/%zu), aborting\n", clock_hms().c_str(),
                                         st->pf_pos, st->prompt.size());
-                                st->finished = true; tlock.unlock(); st->holding = false;
+                                st->finished = true;
+                                if (st->holding) { tlock.unlock(); st->holding = false; }
+                                st->lease.reset();
                                 return false;
                             }
-                            size_t n = std::min(pf_chunk, st->prompt.size() - st->pf_pos);
+                            size_t n = batch ? st->prompt.size() - st->pf_pos
+                                             : std::min(pf_chunk, st->prompt.size() - st->pf_pos);
                             // split at the generation-prompt boundary so a snapshot
                             // lands exactly where a rewritten last turn diverges
                             const int gen_rel = st->gen_begin < 0 ? -1 : st->gen_begin - st->n_cached;
-                            if (gen_rel > (int) st->pf_pos && gen_rel < (int) (st->pf_pos + n))
+                            if (!batch && gen_rel > (int) st->pf_pos && gen_rel < (int) (st->pf_pos + n))
                                 n = (size_t) gen_rel - st->pf_pos;
                             st->prog->base = (int) st->pf_pos;   // overall-progress offset
                             rt->set_embd_overrides(chunk_ovr(st->pf_pos, n));
-                            st->logits = rt->decode(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
+                            st->logits = decode_tokens(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
                                                                          st->prompt.begin() + st->pf_pos + n));
-                            rt->snapshot_ckpt();   // rewind point (incl. prompt end)
+                            if (!batch) rt->snapshot_ckpt();   // rewind point (incl. prompt end)
                             st->pf_pos += n;
-                            if (st->pf_pos < st->prompt.size() && yieldable()) {
+                            if (!batch && st->pf_pos < st->prompt.size() && yieldable()) {
                                 st->my_toks = rt->kv_tokens();           // yield mid-prefill
                                 st->my_imgs = *kv_imgs;
                                 if (getenv("QWEN_CACHE_DEBUG"))
@@ -1711,15 +1761,21 @@ int main(int argc, char ** argv) {
                             st->t_prefill = clk::now();
                             st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         }
-                        int next = st->smp.sample(st->logits);
+                        int next = st->greedy_token >= 0 ? st->greedy_token : st->smp.sample(st->logits);
                         st->smp.accept(next);   // repetition-penalty window
                         // stop on EOS, token budget, or context limit (avoids overflow crash)
-                        if (is_stop(next) || st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx)
+                        if (is_stop(next) || st->generated >= st->max_tokens || past() + 1 >= n_ctx)
                             return finish();
-                        if (!emit_piece(next)) { st->finished = true; tlock.unlock(); st->holding = false; return false; }
+                        if (!emit_piece(next)) {
+                            st->finished = true;
+                            if (st->holding) { tlock.unlock(); st->holding = false; }
+                            st->lease.reset();
+                            return false;
+                        }
                         st->generated++;
-                        st->logits = rt->decode({ next });
-                        if (time_slice > 0 && ++st->slice_used >= time_slice && yieldable()) {
+                        if (batch && st->generated >= st->max_tokens) return finish();
+                        st->logits = decode_tokens({ next });
+                        if (!batch && time_slice > 0 && ++st->slice_used >= time_slice && yieldable()) {
                             st->my_toks = rt->kv_tokens();   // yield the runtime
                             st->my_imgs = *kv_imgs;
                             if (getenv("QWEN_CACHE_DEBUG"))
@@ -1730,6 +1786,14 @@ int main(int argc, char ** argv) {
                         return true;
                     } catch (const std::exception & e) {
                         fprintf(stderr, "stream error: %s\n", e.what());
+                        if (batch) {
+                            const std::string error = "data: " + dumpj(json{{"error", e.what()}}) + "\n\n";
+                            sink.write(error.data(), error.size());
+                            st->finished = true;
+                            st->lease.reset();
+                            sink.done();
+                            return false;
+                        }
                         if (st->holding) { rt->reset(); live_owner = 0; }   // state unknown
                         return finish();
                     }
@@ -1739,18 +1803,33 @@ int main(int argc, char ** argv) {
 
         // non-streaming
         std::string text;
-        int generated = 0, n_cached = 0;
+        int generated = 0, n_cached = 0, batch_past = 0;
+        int32_t greedy_token = -1;
+        std::shared_ptr<BatchExecutor::Lease> lease;
+        auto past = [&] { return batch ? batch_past : rt->n_past(); };
+        auto decode_tokens = [&](const std::vector<int32_t> & tokens) {
+            if (!batch) return std::vector<float>(rt->decode(tokens));
+            auto output = batch->decode(*lease, tokens, batch_greedy);
+            batch_past = output.n_past;
+            greedy_token = output.greedy_token;
+            return std::move(output.logits);
+        };
         Runtime::CacheStats cstat0;
         using clk = std::chrono::steady_clock;
         clk::time_point t0, t_prefill = {}, t_end = {};
         try {
             struct Guard {
                 TicketLock & t;
-                Guard(TicketLock & t_) : t(t_) { t.lock(); }
-                ~Guard() { t.unlock(); }
-            } lk(tlock);
+                bool enabled;
+                Guard(TicketLock & t_, bool enabled_) : t(t_), enabled(enabled_) { if (enabled) t.lock(); }
+                ~Guard() { if (enabled) t.unlock(); }
+            } lk(tlock, !batch);
+            if (batch) {
+                lease = batch->acquire_for(std::chrono::seconds(600));
+                if (!lease) throw std::runtime_error("batch admission timed out");
+            }
             auto prog = std::make_shared<Prog>();
-            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0, prog, t_recv);
+            n_cached = batch ? 0 : prepare_prompt(prompt, ovr, std::move(spans), 0, prog, t_recv);
             cstat0 = rt->cache_stats();
             t0 = clk::now();
             // checkpoint at the generation-prompt boundary (see streaming path)
@@ -1781,20 +1860,20 @@ int main(int argc, char ** argv) {
             } else {
                 Sampler smp(sc);
                 if (!ovr.empty()) rt->set_embd_overrides(ovr);   // vision
-                if (gen_rel > 0 && gen_rel < (int) prompt.size() && ovr.empty()) {
-                    rt->decode(std::vector<int32_t>(prompt.begin(), prompt.begin() + gen_rel));
+                if (!batch && gen_rel > 0 && gen_rel < (int) prompt.size() && ovr.empty()) {
+                    decode_tokens(std::vector<int32_t>(prompt.begin(), prompt.begin() + gen_rel));
                     rt->snapshot_ckpt();
                     prompt.erase(prompt.begin(), prompt.begin() + gen_rel);
                 }
-                auto logits = rt->decode(prompt);
-                rt->snapshot_ckpt();   // rewind point at prompt end
+                auto logits = decode_tokens(prompt);
+                if (!batch) rt->snapshot_ckpt();   // rewind point at prompt end
                 t_prefill = clk::now();
                 smp.prime(cp.ids);     // repetition-penalty window (prompt tail)
                 clk::time_point glog = clk::now();
                 for (int t = 0; t < max_tokens; ++t) {
-                    int next = smp.sample(logits);
+                    int next = greedy_token >= 0 ? greedy_token : smp.sample(logits);
                     smp.accept(next);
-                    if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
+                    if (is_stop(next) || past() + 1 >= n_ctx) break;
                     text += tok->decode(next);
                     ++generated;
                     if (clk::now() - glog >= std::chrono::seconds(10)) {   // long-output progress
@@ -1803,12 +1882,19 @@ int main(int argc, char ** argv) {
                                 clock_hms().c_str(), generated, el > 0 ? generated / el : 0.0);
                         glog = clk::now();
                     }
-                    logits = rt->decode({ next });
+                    if (batch && generated >= max_tokens) break;
+                    if (batch && t + 1 == max_tokens) break;
+                    logits = decode_tokens({ next });
                 }
             }
             t_end = clk::now();
         } catch (const std::exception & e) {
             fprintf(stderr, "generation error: %s\n", e.what());  // return what we have
+            if (batch) {
+                res.status = 500;
+                res.set_content(dumpj(json{{"error", e.what()}}), "application/json");
+                return;
+            }
             rt->reset();   // state unknown: invalidate the prefix cache
             if (t_end == clk::time_point{}) t_end = clk::now();
         }
@@ -1841,7 +1927,7 @@ int main(int argc, char ** argv) {
             msg["tool_calls"] = tcs;
         }
         const bool truncated = calls.empty() &&
-            (generated >= max_tokens || rt->n_past() + 1 >= n_ctx);
+            (generated >= max_tokens || past() + 1 >= n_ctx);
         const char * fr = !calls.empty() ? "tool_calls" : (truncated ? "length" : "stop");
         json resp = {
             {"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", model_id},

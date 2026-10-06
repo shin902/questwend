@@ -75,6 +75,13 @@ if(BUILD_TESTING)
     add_executable(qw-qsa-topk tests/qsa_topk.cpp)
     target_link_libraries(qw-qsa-topk PRIVATE ggml)
     add_test(NAME qsa_topk_shape COMMAND qw-qsa-topk)
+    add_executable(qw-batch-runtime tests/batch_runtime.cpp)
+    target_link_libraries(qw-batch-runtime PRIVATE questwend_core)
+    target_include_directories(qw-batch-runtime PRIVATE server)
+    add_test(NAME batch_sequence_isolation COMMAND qw-batch-runtime --cpu)
+    add_test(NAME batch_gdn_tail_isolation COMMAND qw-batch-runtime --gdn-tail --cpu)
+    add_executable(qw-mtp-resume tests/mtp_resume.cpp)
+    target_link_libraries(qw-mtp-resume PRIVATE questwend_core)
 endif()
 
 # ---- Server (OpenAI-compatible) ----

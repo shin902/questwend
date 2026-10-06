@@ -5,8 +5,6 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
-#define FLT_MAX 3.402823466e+38F
-
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
@@ -25,7 +23,7 @@ void main() {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
+    A_TYPE amax = A_TYPE(uintBitsToFloat(0xff800000));
     uint acol = col;
 
     if (col < p.KX) {
@@ -46,7 +44,8 @@ void main() {
     barrier();
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
         if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
+            if (tmpmax[col] < tmpmax[col + s] ||
+                (tmpmax[col] == tmpmax[col + s] && tmp[col + s] < tmp[col])) {
                 tmpmax[col] = tmpmax[col + s];
                 tmp[col] = tmp[col + s];
             }

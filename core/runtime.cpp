@@ -325,6 +325,40 @@ struct Runtime::Impl {
 
     ggml_gallocr_t galloc = nullptr;
 
+    struct Sequence {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        std::vector<ggml_tensor *> keys, values, conv, ssm;
+        int past = 0;
+        ~Sequence() {
+            if (buffer) ggml_backend_buffer_free(buffer);
+            if (ctx) ggml_free(ctx);
+        }
+    };
+    struct BatchLane {
+        Sequence * sequence;
+        int first, count, kv_width;
+        bool want_logits;
+        ggml_tensor * mask = nullptr;
+        ggml_tensor * write_rows = nullptr;
+    };
+    std::vector<std::unique_ptr<Sequence>> sequences;
+    std::vector<BatchLane> batch_lanes;
+    struct BatchGraph {
+        std::vector<int> shape;
+        ggml_context * ctx = nullptr;
+        ggml_cgraph * graph = nullptr;
+        ggml_gallocr_t allocator = nullptr;
+        ~BatchGraph() {
+            if (allocator) ggml_gallocr_free(allocator);
+            if (ctx) ggml_free(ctx);
+        }
+    };
+    std::unique_ptr<BatchGraph> batch_graphs[2];
+    ggml_tensor * select_batch_outputs(ggml_context * ctx, ggml_tensor * input);
+    void configure_batch_slots(int count);
+    std::vector<Runtime::BatchOutput> decode_batch(const std::vector<Runtime::BatchInput> & inputs);
+
     // MTP (multi-token prediction): the trailing nextn block drafts the next-next
     // token from the main model's last hidden state. Used for self-speculative
     // decoding. The MTP block has its own KV cache slot (k/v_cache[n_main]).
@@ -484,6 +518,8 @@ struct Runtime::Impl {
         if (galloc)         ggml_gallocr_free(galloc);
         if (dgalloc)        ggml_gallocr_free(dgalloc);
         if (dctx)           ggml_free(dctx);
+        for (auto & graph : batch_graphs) graph.reset();
+        sequences.clear();
         for (auto b : st_bufs) if (b) ggml_backend_buffer_free(b);
         if (st_ctx)         ggml_free(st_ctx);
         // expert_cpu_bufs and weights_bufs are owned here (not by Model) in
@@ -591,9 +627,13 @@ struct Runtime::Impl {
     // prefill passes n_past+offset so a layer's chunks land consecutively.
     ggml_tensor * build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
                              ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
-                             ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos = -1);
+                             ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos = -1,
+                             BatchLane * lane = nullptr);
     ggml_tensor * build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
+    ggml_tensor * build_gdn_scan(ggml_context * ctx, ggml_cgraph * gf, int il, int n_tokens,
+                                 ggml_tensor * qkv, ggml_tensor * beta, ggml_tensor * gate,
+                                 Sequence * sequence);
     // ---- qwen4exp hyper-connections ----
     // The residual is hc_count streams wide. Each block reads one n_embd-wide
     // view of it (build_hc_mix) and its output is scattered back over all the
@@ -652,7 +692,8 @@ struct Runtime::Impl {
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                       const std::function<bool(int32_t)> & on_token,
                       int32_t * out_pending = nullptr,
-                      bool ckpt_after_prefill = false);
+                      bool ckpt_after_prefill = false,
+                      int32_t resume_token = -1);
     void prefill(const std::vector<int32_t> & toks, bool mtp_kv);
 
     // ---- prompt-position checkpoints (prefix-cache rewind) ----
@@ -1620,10 +1661,40 @@ int Runtime::Impl::fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens,
     return cur;
 }
 
+ggml_tensor * Runtime::Impl::select_batch_outputs(ggml_context * ctx, ggml_tensor * input) {
+    const int rows = (int) std::count_if(batch_lanes.begin(), batch_lanes.end(),
+                                       [](const auto & lane) { return lane.want_logits; });
+    if (rows == input->ne[1]) return input;
+    ggml_tensor * output = nullptr;
+    for (const auto & lane : batch_lanes) {
+        if (!lane.want_logits) continue;
+        auto * tail = ggml_cont(ctx, ggml_view_2d(ctx, input, input->ne[0], 1, input->nb[1],
+                (size_t) (lane.first + lane.count - 1) * input->nb[1]));
+        output = output ? ggml_concat(ctx, output, tail, 1) : tail;
+    }
+    return output;
+}
+
 // ---- gated attention (shared by qwen3 plain and qwen35 gated paths) ----
 ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
-        ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos) {
+        ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos, BatchLane * lane) {
+    if (!batch_lanes.empty() && !lane) {
+        ggml_tensor * output = nullptr;
+        for (auto & part : batch_lanes) {
+            auto slice = [&](ggml_tensor * tensor) {
+                return ggml_view_3d(ctx, tensor, tensor->ne[0], tensor->ne[1], part.count,
+                        tensor->nb[1], tensor->nb[2], (size_t) part.first * tensor->nb[2]);
+            };
+            ggml_tensor * current = build_attn(ctx, gf, il, slice(Q), slice(K), slice(V),
+                    part.mask, part.count, part.kv_width, part.sequence->past, &part);
+            if (current) output = output ? ggml_concat(ctx, output, current, 1) : current;
+        }
+        return output;
+    }
+    ggml_tensor * keys = lane ? lane->sequence->keys[il] : k_cache[il];
+    ggml_tensor * values = lane ? lane->sequence->values[il] : v_cache[il];
+    ggml_tensor * write_rows = lane ? lane->write_rows : d_kvidx;
     if (kv_pos < 0) kv_pos = n_past;
     const auto & hp = model.hparams();
     const int n_head      = hp.n_head;
@@ -1637,21 +1708,29 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
     ggml_tensor * Vflat = ggml_reshape_2d(ctx, V, n_embd_gqa, n_tokens);
     if (persistent) {
         // dynamic write position via index input -> graph stays identical each step
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache[il], Kflat, d_kvidx));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache[il], Vflat, d_kvidx));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, keys, Kflat, write_rows));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, values, Vflat, write_rows));
     } else {
-        ggml_tensor * k_dst = ggml_view_2d(ctx, k_cache[il], n_embd_gqa, n_tokens,
-                                           k_cache[il]->nb[1], (size_t) kv_pos * k_cache[il]->nb[1]);
+        ggml_tensor * k_dst = ggml_view_2d(ctx, keys, n_embd_gqa, n_tokens,
+                                           keys->nb[1], (size_t) kv_pos * keys->nb[1]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Kflat, k_dst));
-        ggml_tensor * v_dst = ggml_view_2d(ctx, v_cache[il], n_embd_gqa, n_tokens,
-                                           v_cache[il]->nb[1], (size_t) kv_pos * v_cache[il]->nb[1]);
+        ggml_tensor * v_dst = ggml_view_2d(ctx, values, n_embd_gqa, n_tokens,
+                                           values->nb[1], (size_t) kv_pos * values->nb[1]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Vflat, v_dst));
     }
 
+    if (lane && il + 1 == (int) hp.n_main()) {
+        if (!lane->want_logits) return nullptr;
+        Q = ggml_view_3d(ctx, Q, Q->ne[0], Q->ne[1], 1, Q->nb[1], Q->nb[2],
+                         (size_t) (n_tokens - 1) * Q->nb[2]);
+        mask = ggml_view_2d(ctx, mask, mask->ne[0], 1, mask->nb[1],
+                           (size_t) (n_tokens - 1) * mask->nb[1]);
+        n_tokens = 1;
+    }
     // K, V views from cache: [head_dim, n_kv, n_head_kv]
-    ggml_tensor * Kc = ggml_view_2d(ctx, k_cache[il], n_embd_gqa, n_kv, k_cache[il]->nb[1], 0);
+    ggml_tensor * Kc = ggml_view_2d(ctx, keys, n_embd_gqa, n_kv, keys->nb[1], 0);
     Kc = ggml_permute(ctx, ggml_reshape_3d(ctx, Kc, n_embd_head, n_head_kv, n_kv), 0, 2, 1, 3);
-    ggml_tensor * Vc = ggml_view_2d(ctx, v_cache[il], n_embd_gqa, n_kv, v_cache[il]->nb[1], 0);
+    ggml_tensor * Vc = ggml_view_2d(ctx, values, n_embd_gqa, n_kv, values->nb[1], 0);
     Vc = ggml_permute(ctx, ggml_reshape_3d(ctx, Vc, n_embd_head, n_head_kv, n_kv), 0, 2, 1, 3);
 
     if (use_flash) {
@@ -1667,7 +1746,7 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
     kq = ggml_soft_max_ext(ctx, kq, mask, kq_scale, 0.0f);
 
     // V for the manual path: [n_kv, head, head_kv]
-    ggml_tensor * Vslice = ggml_view_2d(ctx, v_cache[il], n_embd_gqa, n_kv, v_cache[il]->nb[1], 0);
+    ggml_tensor * Vslice = ggml_view_2d(ctx, values, n_embd_gqa, n_kv, values->nb[1], 0);
     ggml_tensor * Vt = ggml_cont(ctx, ggml_transpose(ctx, Vslice));   // [n_kv, n_embd_gqa]
     ggml_tensor * Vm = ggml_reshape_3d(ctx, Vt, n_kv, n_embd_head, n_head_kv);
     ggml_tensor * kqv = ggml_mul_mat(ctx, Vm, kq);
@@ -1680,17 +1759,12 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
 ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * x, int n_tokens) {
     const auto & hp = model.hparams();
-    const int S        = hp.ssm_d_state;         // 128
-    const int H_k      = hp.ssm_n_group;         // 16
-    const int H_v      = hp.ssm_dt_rank;         // 16
-    const int key_dim  = S * H_k;                // 2048
-    const int conv_ch  = hp.ssm_d_inner + 2 * H_k * S; // 6144
-    const float eps    = hp.rms_eps;
-    const size_t el    = sizeof(float);
+    const int S = hp.ssm_d_state;
+    const int H_v = hp.ssm_dt_rank;
+    const float eps = hp.rms_eps;
 
     // projections
     ggml_tensor * qkv_mixed = ggml_mul_mat(ctx, W("blk.%d.attn_qkv.weight", il), x);   // [conv_ch, n_tokens]
-    ggml_tensor * z         = ggml_mul_mat(ctx, W("blk.%d.attn_gate.weight", il), x);  // [d_inner, n_tokens]
 
     ggml_tensor * beta = ggml_mul_mat(ctx, W("blk.%d.ssm_beta.weight", il), x);        // [H_v, n_tokens]
     beta = ggml_sigmoid(ctx, beta);
@@ -1702,9 +1776,54 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
     ggml_tensor * g = ggml_mul(ctx, alpha, W("blk.%d.ssm_a", il));                     // [H_v, n_tokens]
     g = ggml_reshape_4d(ctx, g, 1, H_v, n_tokens, 1);
 
+    ggml_tensor * output = nullptr;
+    if (batch_lanes.size() <= 1) {
+        output = build_gdn_scan(ctx, gf, il, n_tokens, qkv_mixed, beta, g,
+                                batch_lanes.empty() ? nullptr : batch_lanes.front().sequence);
+    } else {
+        for (const auto & lane : batch_lanes) {
+            auto rows = [&](ggml_tensor * tensor) {
+                return ggml_cont(ctx, ggml_view_4d(ctx, tensor, tensor->ne[0], tensor->ne[1],
+                        lane.count, 1, tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                        (size_t) lane.first * tensor->nb[2]));
+            };
+            ggml_tensor * qkv = ggml_cont(ctx, ggml_view_2d(ctx, qkv_mixed, qkv_mixed->ne[0],
+                    lane.count, qkv_mixed->nb[1], (size_t) lane.first * qkv_mixed->nb[1]));
+            ggml_tensor * current = build_gdn_scan(ctx, gf, il, lane.count, qkv, rows(beta), rows(g), lane.sequence);
+            output = output ? ggml_concat(ctx, output, current, 2) : current;
+        }
+    }
+    ggml_tensor * gate_input = x;
+    if (!batch_lanes.empty() && il + 1 == (int) hp.n_main()) {
+        gate_input = select_batch_outputs(ctx, x);
+        if (!gate_input) return nullptr;
+        output = select_batch_outputs(ctx, ggml_reshape_2d(ctx, output, S * H_v, n_tokens));
+        n_tokens = (int) output->ne[1];
+        output = ggml_reshape_4d(ctx, output, S, H_v, n_tokens, 1);
+    }
+    ggml_tensor * z = ggml_mul_mat(ctx, W("blk.%d.attn_gate.weight", il), gate_input);
+    output = ggml_rms_norm(ctx, ggml_cont(ctx, output), eps);
+    output = ggml_mul(ctx, output, W("blk.%d.ssm_norm.weight", il));
+    ggml_tensor * zr = ggml_reshape_4d(ctx, z, S, H_v, n_tokens, 1);
+    output = ggml_mul(ctx, output, hp.arch == Arch::QWEN4EXP ? ggml_sigmoid(ctx, zr) : ggml_silu(ctx, zr));
+    output = ggml_reshape_2d(ctx, output, S * H_v, n_tokens);
+    return ggml_mul_mat(ctx, W("blk.%d.ssm_out.weight", il), output);
+}
+
+ggml_tensor * Runtime::Impl::build_gdn_scan(ggml_context * ctx, ggml_cgraph * gf, int il,
+        int n_tokens, ggml_tensor * qkv_mixed, ggml_tensor * beta, ggml_tensor * g,
+        Sequence * sequence) {
+    const auto & hp = model.hparams();
+    const int S = hp.ssm_d_state, H_k = hp.ssm_n_group, H_v = hp.ssm_dt_rank;
+    const int key_dim = S * H_k;
+    const int conv_ch = hp.ssm_d_inner + 2 * H_k * S;
+    const float eps = hp.rms_eps;
+    const size_t el = sizeof(float);
+    ggml_tensor * conv = sequence ? sequence->conv[il] : conv_state[il];
+    ggml_tensor * ssm = sequence ? sequence->ssm[il] : ssm_state[il];
     // causal conv1d with state
     ggml_tensor * conv_kernel = W("blk.%d.ssm_conv1d.weight", il);   // [d_conv, conv_ch]
-    ggml_tensor * cs = ggml_reshape_3d(ctx, conv_state[il], hp.ssm_d_conv - 1, conv_ch, 1);
+    ggml_tensor * cs = ggml_reshape_3d(ctx, conv, hp.ssm_d_conv - 1, conv_ch, 1);
     ggml_tensor * qkv_t = ggml_transpose(ctx, qkv_mixed);           // [n_tokens, conv_ch]
     ggml_tensor * conv_input = ggml_concat(ctx, cs, qkv_t, 0);      // [d_conv-1+n_tokens, conv_ch, 1]
 
@@ -1712,7 +1831,7 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
     ggml_tensor * cs_last = ggml_view_3d(ctx, conv_input, hp.ssm_d_conv - 1, conv_ch, 1,
             conv_input->nb[1], conv_input->nb[2],
             ggml_row_size(conv_input->type, n_tokens));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, cs_last, conv_state[il]));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, cs_last, conv));
 
     // verify-mode checkpoints: conv state after token t = timesteps [t+1 .. t+d_conv-1]
     if (gdn_ckpt == n_tokens && n_tokens > 1) {
@@ -1744,7 +1863,7 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
     // fused gated delta net: returns output + new state packed in one tensor.
     // The state input is the initial state s0 only, shaped [S, S, H_v, n_seqs];
     // the snapshot slot count K is an op param (1 = keep the final state only).
-    ggml_tensor * s_in  = ggml_reshape_4d(ctx, ssm_state[il], S, S, H_v, 1);
+    ggml_tensor * s_in  = ggml_reshape_4d(ctx, ssm, S, S, H_v, 1);
     ggml_tensor * output;
     if (gdn_ckpt == n_tokens && n_tokens > 1) {
         // verify mode: run the scan per token (same sequential math, same FLOPs)
@@ -1767,7 +1886,7 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, st_t, ckpt_ssm[t][il]));
             if (t + 1 == n_tokens)
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, st_t,
-                        ggml_reshape_3d(ctx, ssm_state[il], S, S, H_v)));
+                        ggml_reshape_3d(ctx, ssm, S, S, H_v)));
             s_in = ggml_view_4d(ctx, rt, S, S, H_v, 1,
                     rs(S), rs(S * S), rs(S * S * H_v), rs(S * H_v));   // chain
             output = output ? ggml_concat(ctx, output, out_t, 2) : out_t;
@@ -1786,22 +1905,10 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
                 ggml_row_size(result->type, S * S * H_v),
                 ggml_row_size(result->type, S * H_v * n_tokens));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state,
-                ggml_reshape_3d(ctx, ssm_state[il], S, S, H_v)));
+                ggml_reshape_3d(ctx, ssm, S, S, H_v)));
     }
 
-    // gated RMSNorm with z: rms_norm(output)*ssm_norm * gate(z)
-    output = ggml_cont(ctx, output);
-    output = ggml_rms_norm(ctx, output, eps);
-    output = ggml_mul(ctx, output, W("blk.%d.ssm_norm.weight", il));   // broadcast [S]
-    ggml_tensor * zr = ggml_reshape_4d(ctx, z, S, H_v, n_tokens, 1);
-    // qwen4exp is Qwen3.5's GDN with one numerical difference: the output gate
-    // is a sigmoid rather than a silu.
-    output = ggml_mul(ctx, output, hp.arch == Arch::QWEN4EXP ? ggml_sigmoid(ctx, zr)
-                                                             : ggml_silu(ctx, zr));
-
-    output = ggml_reshape_2d(ctx, output, S * H_v, n_tokens);
-    ggml_tensor * cur = ggml_mul_mat(ctx, W("blk.%d.ssm_out.weight", il), output);  // [n_embd, n_tokens]
-    return cur;
+    return output;
 }
 
 // ---- qwen4exp hyper-connections ----
@@ -2270,27 +2377,10 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);            // silu(gate)*up [ff_exp, n_used, n_tokens]
         ggml_tensor * experts = ggml_mul_mat_id(ctx, W("blk.%d.ffn_down_exps.weight", il), act, selected); // [n_embd, n_used, n_tokens]
 
-        if (n_tokens == 1) {
-            // weighted sum of the n_used experts as a single GEMV:
-            //   moe_out[e] = sum_k experts[e,k] * weights[k]
-            ggml_tensor * et = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n_used))); // [n_used, n_embd]
-            ggml_tensor * w  = ggml_reshape_2d(ctx, weights, n_used, 1);
-            moe_out = ggml_mul_mat(ctx, et, w);   // [n_embd, 1]
-        } else {
-            experts = ggml_mul(ctx, experts, weights);
-            ggml_build_forward_expand(gf, experts);
-            ggml_tensor * cur_experts[256] = { nullptr };
-            for (int i = 0; i < n_used; ++i) {
-                cur_experts[i] = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], (size_t) i * experts->nb[1]);
-                ggml_build_forward_expand(gf, cur_experts[i]);
-            }
-            moe_out = cur_experts[0];
-            for (int i = 1; i < n_used; ++i) {
-                moe_out = ggml_add(ctx, moe_out, cur_experts[i]);
-                ggml_build_forward_expand(gf, moe_out);
-            }
-            if (n_used == 1) moe_out = ggml_cont(ctx, moe_out);
-        }
+        // Mixing GEMV and separate multiply/add reductions amplifies rounding drift in later quantization.
+        ggml_tensor * et = ggml_cont(ctx, ggml_permute(ctx, experts, 1, 0, 2, 3));
+        ggml_tensor * w = ggml_reshape_3d(ctx, weights, n_used, 1, n_tokens);
+        moe_out = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, et, w), n_embd, n_tokens);
     }
 
     // shared expert (qwen35moe / qwen3next): gated SwiGLU added to the MoE output
@@ -2326,7 +2416,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tokens);
     ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
 
-    if (persistent) {
+    if (persistent && batch_lanes.empty()) {
         d_kvidx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
         ggml_set_input(d_kvidx); ggml_set_name(d_kvidx, "inp_kvidx");
     }
@@ -2423,9 +2513,18 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
                                              n_tokens, n_kv, n_past, qsa);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, n_tokens, n_kv);
+            if (!att) return gf;
+            if (!batch_lanes.empty() && il + 1 == (int) hp.n_main()) {
+                att = select_batch_outputs(ctx, att);
+                if (!att) return gf;
+                if (gated) gate = select_batch_outputs(ctx, gate);
+            }
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
+        if (!cur) return gf;
+        if (!batch_lanes.empty() && il + 1 == (int) hp.n_main())
+            inpSA = select_batch_outputs(ctx, inpSA);
 
         ggml_tensor * ffn_res = nullptr;
         ggml_tensor * ffn_in;
@@ -2450,7 +2549,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
         ggml_tensor * ff;
         if (hp.is_moe()) {
-            ff = build_moe(ctx, gf, il, ffn_in, n_tokens);
+            ff = build_moe(ctx, gf, il, ffn_in, (int) ffn_in->ne[1]);
         } else {
             ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), ffn_in);
             ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), ffn_in);
@@ -2468,7 +2567,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     // (hc has no single n_embd-wide "last hidden", but no hc model carries an
     //  MTP block either, so the two never meet)
     GGML_ASSERT(!(capture_hidden && hc_on) && "MTP capture is not defined for a hyper-connection residual");
-    if (capture_hidden) {
+    if (capture_hidden && batch_lanes.empty()) {
         ggml_set_name(inpL, "main_hidden");
         ggml_set_output(inpL);
         ggml_build_forward_expand(gf, inpL);
@@ -2493,7 +2592,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
                 model.tensor("output_hc_up.weight"), nullptr, nullptr);
     } else {
         ggml_tensor * head_in = inpL;
-        if (!logits_all && n_tokens > 1) {
+        if (batch_lanes.empty() && !logits_all && n_tokens > 1) {
             head_in = ggml_cont(ctx, ggml_view_2d(ctx, inpL, n_embd, 1, inpL->nb[1],
                                                   (size_t) (n_tokens - 1) * inpL->nb[1]));
         }
@@ -3044,8 +3143,12 @@ void Runtime::Impl::prefill(const std::vector<int32_t> & toks, bool mtp_kv) {
 
 void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                                  const std::function<bool(int32_t)> & on_token,
-                                 int32_t * out_pending, bool ckpt_after_prefill) {
+                                 int32_t * out_pending, bool ckpt_after_prefill,
+                                 int32_t resume_token) {
     const auto & hp = model.hparams();
+    if (resume_token < -1 || resume_token >= (int32_t) hp.n_vocab ||
+        (resume_token >= 0 && (!prompt.empty() || n_past <= 0)))
+        throw std::runtime_error("generate_mtp: invalid resume token or state");
     const bool gdn = hp.has_gdn;
     const int  K   = n_draft < 1 ? 1 : n_draft;
     static const bool no_accept = getenv("QWEN_MTP_NOACCEPT") != nullptr;
@@ -3069,12 +3172,11 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
     // prefix (n_past > 0); prefill bridges the nextn KV across the boundary.
     const int P = (int) prompt.size();
     if (P > 0) prefill(prompt, /*mtp_kv=*/true);
-    std::vector<float> mlog = logits;    // logits of the last prefilled token
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
     // prompt fully in KV, nothing generated yet: the state the next request
     // rewinds to when the client edits/drops parts of this turn's output
     if (ckpt_after_prefill && P > 0) pk_snapshot();
-    int32_t x = argmax(mlog);            // first generated token
+    int32_t x = resume_token >= 0 ? resume_token : argmax(logits);
     // invariant at loop top: n_past = pos(x), mtp_past = pos(x)-1, mtp_hidden = h_{pos(x)-1}
     int generated = 0;
     long steps = 0, draft_forwards = 0, accepted_drafts = 0;
@@ -4978,12 +5080,202 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     return logits;
 }
 
+void Runtime::Impl::configure_batch_slots(int count) {
+    const auto & hp = model.hparams();
+    if (count < 1 || count > 4 || !sequences.empty())
+        throw std::runtime_error("batch slots: configure once with 1..4 slots");
+    if (sched || ecache || cfg.use_mtp || hp.has_hc() || hp.has_qsa() || hp.has_ple())
+        throw std::runtime_error("batch slots require resident, single-backend, plain text AR");
+    size_t per_slot = 0;
+    for (int layer = 0; layer < (int) hp.n_main(); ++layer) per_slot += state_bytes(layer);
+    size_t available = 0, total = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(backend), &available, &total);
+    if (available && per_slot * count + compute_headroom() > available)
+        throw std::runtime_error("batch slots: insufficient device memory for independent states");
+    for (int slot = 0; slot < count; ++slot) {
+        auto sequence = std::make_unique<Sequence>();
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead() * hp.n_main() * 4 + 4096;
+        params.no_alloc = true;
+        sequence->ctx = ggml_init(params);
+        if (!sequence->ctx) throw std::runtime_error("batch slots: context allocation failed");
+        auto clone = [&](const std::vector<ggml_tensor *> & source) {
+            std::vector<ggml_tensor *> tensors(hp.n_layer, nullptr);
+            for (int layer = 0; layer < (int) hp.n_main(); ++layer) {
+                if (!source[layer]) continue;
+                tensors[layer] = ggml_dup_tensor(sequence->ctx, source[layer]);
+                ggml_set_name(tensors[layer], ("slot" + std::to_string(slot) + "." +
+                        ggml_get_name(source[layer])).c_str());
+            }
+            return tensors;
+        };
+        sequence->keys = clone(k_cache);
+        sequence->values = clone(v_cache);
+        sequence->conv = clone(conv_state);
+        sequence->ssm = clone(ssm_state);
+        sequence->buffer = ggml_backend_alloc_ctx_tensors(sequence->ctx, backend);
+        if (!sequence->buffer)
+            throw_alloc_failure(ggml_backend_get_default_buffer_type(backend), per_slot,
+                                "an active batch sequence");
+        ggml_backend_buffer_clear(sequence->buffer, 0);
+        sequences.push_back(std::move(sequence));
+    }
+    for (auto & graph : batch_graphs) {
+        graph = std::make_unique<BatchGraph>();
+        graph->allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    fprintf(stderr, "batch slots: %d independent resident states (%zu MB), shared weights\n",
+            count, per_slot * count >> 20);
+}
+
+std::vector<Runtime::BatchOutput> Runtime::Impl::decode_batch(
+        const std::vector<Runtime::BatchInput> & inputs) {
+    if (inputs.empty() || inputs.size() > sequences.size())
+        throw std::runtime_error("decode_batch: invalid batch size");
+    std::vector<bool> used(sequences.size(), false);
+    for (const auto & input : inputs) {
+        if (input.slot < 0 || (size_t) input.slot >= sequences.size() || used[input.slot])
+            throw std::runtime_error("decode_batch: invalid or duplicate slot");
+        used[input.slot] = true;
+        const int past = input.reset ? 0 : sequences[input.slot]->past;
+        if (input.tokens.empty() || input.tokens.size() > (size_t) (n_ctx - past))
+            throw std::runtime_error("decode_batch: empty input or context overflow");
+        for (int32_t token : input.tokens)
+            if (token < 0 || token >= (int32_t) model.hparams().n_vocab)
+                throw std::runtime_error("decode_batch: token out of vocabulary");
+    }
+    struct LaneScope {
+        std::vector<BatchLane> & lanes;
+        ~LaneScope() { lanes.clear(); }
+    } scope{batch_lanes};
+    const bool prefill = std::any_of(inputs.begin(), inputs.end(),
+                                    [](const auto & input) { return input.tokens.size() > 1; });
+    auto & cache = *batch_graphs[prefill ? 1 : 0];
+    auto & batch_shape = cache.shape;
+    auto & batch_ctx = cache.ctx;
+    auto & batch_graph = cache.graph;
+    auto & batch_allocator = cache.allocator;
+    std::vector<int> shape;
+    const bool reusable = getenv("QWEN_NO_REUSE") == nullptr;
+    int token_count = 0;
+    for (const auto & input : inputs) {
+        Sequence & sequence = *sequences[input.slot];
+        if (input.reset) {
+            ggml_backend_buffer_clear(sequence.buffer, 0);
+            sequence.past = 0;
+        }
+        const int count = (int) input.tokens.size();
+        const int width = reusable ? std::min(n_ctx, ((sequence.past + count + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET)
+                                   : sequence.past + count;
+        shape.insert(shape.end(), {input.slot, count, width, reusable ? -1 : sequence.past,
+                                   input.greedy, input.want_logits});
+        batch_lanes.push_back({&sequence, token_count, count, width, input.want_logits});
+        token_count += count;
+    }
+    if (!batch_graph || shape != batch_shape) {
+        batch_graph = nullptr;
+        if (batch_ctx) { ggml_free(batch_ctx); batch_ctx = nullptr; }
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead() * GRAPH_SIZE +
+                          ggml_graph_overhead_custom(GRAPH_SIZE, false);
+        params.no_alloc = true;
+        batch_ctx = ggml_init(params);
+        if (!batch_ctx) throw std::runtime_error("decode_batch: graph context allocation failed");
+        for (size_t index = 0; index < batch_lanes.size(); ++index) {
+            auto & lane = batch_lanes[index];
+            lane.mask = ggml_new_tensor_2d(batch_ctx, GGML_TYPE_F16, lane.kv_width, lane.count);
+            lane.write_rows = ggml_new_tensor_1d(batch_ctx, GGML_TYPE_I64, lane.count);
+            ggml_set_input(lane.mask);
+            ggml_set_input(lane.write_rows);
+            ggml_set_name(lane.mask, ("batch_mask_" + std::to_string(index)).c_str());
+            ggml_set_name(lane.write_rows, ("batch_rows_" + std::to_string(index)).c_str());
+        }
+        persistent = reusable;
+        try {
+            batch_graph = build_graph(batch_ctx, token_count, 1, false);
+            if (std::any_of(inputs.begin(), inputs.end(), [](const auto & input) { return input.greedy && input.want_logits; })) {
+                auto * greedy = ggml_argmax(batch_ctx, ggml_graph_get_tensor(batch_graph, "logits"));
+                ggml_set_name(greedy, "batch_greedy_tokens");
+                ggml_set_output(greedy);
+                ggml_build_forward_expand(batch_graph, greedy);
+            }
+        } catch (...) {
+            persistent = false;
+            throw;
+        }
+        persistent = false;
+        if (!ggml_gallocr_alloc_graph(batch_allocator, batch_graph)) {
+            batch_graph = nullptr;
+            throw std::runtime_error("decode_batch: graph allocation failed");
+        }
+        batch_shape = shape;
+    }
+    std::vector<int32_t> tokens, positions(rope_dim(token_count), 0);
+    const int planes = model.hparams().use_mrope ? 3 : 1;
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), hidden = ggml_fp32_to_fp16(-INFINITY);
+    for (size_t index = 0; index < inputs.size(); ++index) {
+        const auto & lane = batch_lanes[index];
+        tokens.insert(tokens.end(), inputs[index].tokens.begin(), inputs[index].tokens.end());
+        std::vector<int64_t> rows(lane.count);
+        std::vector<ggml_fp16_t> mask((size_t) lane.kv_width * lane.count);
+        for (int token = 0; token < lane.count; ++token) {
+            rows[token] = lane.sequence->past + token;
+            for (int plane = 0; plane < planes; ++plane)
+                positions[(size_t) plane * token_count + lane.first + token] = (int32_t) rows[token];
+            for (int column = 0; column < lane.kv_width; ++column)
+                mask[(size_t) token * lane.kv_width + column] = column <= rows[token] ? zero : hidden;
+        }
+        if (auto * tensor = ggml_graph_get_tensor(batch_graph, ("batch_mask_" + std::to_string(index)).c_str()))
+            ggml_backend_tensor_set(tensor, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        if (reusable)
+            if (auto * tensor = ggml_graph_get_tensor(batch_graph, ("batch_rows_" + std::to_string(index)).c_str()))
+                ggml_backend_tensor_set(tensor, rows.data(), 0, rows.size() * sizeof(int64_t));
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(batch_graph, "inp_tokens"), tokens.data(), 0,
+                            tokens.size() * sizeof(int32_t));
+    if (auto * tensor = ggml_graph_get_tensor(batch_graph, "inp_pos"))
+        ggml_backend_tensor_set(tensor, positions.data(), 0, positions.size() * sizeof(int32_t));
+    if (compute_graph(batch_graph) != GGML_STATUS_SUCCESS) {
+        batch_graph = nullptr;
+        throw std::runtime_error("decode_batch: graph compute failed; reset affected slots before reuse");
+    }
+    ggml_tensor * output = ggml_graph_get_tensor(batch_graph, "logits");
+    std::vector<Runtime::BatchOutput> decoded;
+    size_t output_index = 0;
+    for (size_t index = 0; index < inputs.size(); ++index) {
+        auto & lane = batch_lanes[index];
+        lane.sequence->past += lane.count;
+        Runtime::BatchOutput row{{}, lane.sequence->past};
+        if (!inputs[index].want_logits) {
+            decoded.push_back(std::move(row));
+            continue;
+        }
+        if (inputs[index].greedy) {
+            auto * greedy = ggml_graph_get_tensor(batch_graph, "batch_greedy_tokens");
+            ggml_backend_tensor_get(greedy, &row.greedy_token, output_index * sizeof(int32_t), sizeof(int32_t));
+            if (row.greedy_token < 0 || row.greedy_token >= output->ne[0])
+                throw std::runtime_error("decode_batch: invalid greedy token; reset affected slots before reuse");
+        } else {
+            row.logits.resize(output->ne[0]);
+            ggml_backend_tensor_get(output, row.logits.data(), output_index * output->nb[1],
+                                    row.logits.size() * sizeof(float));
+        }
+        ++output_index;
+        decoded.push_back(std::move(row));
+    }
+    return decoded;
+}
+
 // ---- public wrappers ----
 Runtime::Runtime(Model & model, const RuntimeConfig & cfg)
     : impl_(std::make_unique<Impl>(model, cfg)) {
     impl_->init();
 }
 Runtime::~Runtime() = default;
+void Runtime::configure_batch_slots(int count) { impl_->configure_batch_slots(count); }
+std::vector<Runtime::BatchOutput> Runtime::decode_batch(const std::vector<BatchInput> & inputs) {
+    return impl_->decode_batch(inputs);
+}
 
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
     const std::vector<float> & l = impl_->decode(tokens);
@@ -4998,8 +5290,9 @@ const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp
 bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }
 void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                            const std::function<bool(int32_t)> & on_token,
-                           int32_t * out_pending, bool ckpt_after_prefill) {
-    impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
+                           int32_t * out_pending, bool ckpt_after_prefill,
+                           int32_t resume_token) {
+    impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill, resume_token);
 }
 void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
     impl_->prefill(tokens, mtp_kv);

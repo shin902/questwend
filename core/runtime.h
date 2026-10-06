@@ -161,16 +161,36 @@ public:
     // from the current state when n_past > 0 (prompt = the new tail tokens).
     // When generation stops because on_token returned false, *out_pending (if
     // given) receives the next confirmed token that was NOT decoded yet; pass
-    // it as the prompt of a follow-up call to resume seamlessly. Confirmed
+    // it as resume_token with an empty prompt in a follow-up call. Confirmed
     // tokens that were never offered to on_token can additionally sit at the
     // tail of kv_tokens() (a mid-cycle stop); the caller is responsible for
     // delivering those before resuming.
+    // Re-prefilling the pending token changes the verify path and can change
+    // greedy output.
     // ckpt_after_prefill: take a prompt checkpoint (see snapshot_ckpt) once the
     // prompt is fully in KV, before any token is generated.
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                       const std::function<bool(int32_t)> & on_token,
                       int32_t * out_pending = nullptr,
-                      bool ckpt_after_prefill = false);
+                      bool ckpt_after_prefill = false,
+                      int32_t resume_token = -1);
+
+    // Resident text-only batching. Calls, including configure, must have one
+    // compute owner; each slot has independent KV and recurrent state.
+    struct BatchInput {
+        int slot;
+        std::vector<int32_t> tokens;
+        bool reset = false;
+        bool greedy = false;
+        bool want_logits = true;
+    };
+    struct BatchOutput {
+        std::vector<float> logits;
+        int n_past;
+        int32_t greedy_token = -1;
+    };
+    void configure_batch_slots(int count);
+    std::vector<BatchOutput> decode_batch(const std::vector<BatchInput> & inputs);
 
     void reset();                 // clear KV cache / position
     int  n_past() const;

@@ -515,6 +515,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
         const int64_t ids_stride, cudaStream_t stream) {
 
     const bool has_ids = ids != nullptr;
+#ifdef GGML_CUDA_FORCE_MMQ
+    if (!has_ids && std::is_same_v<T, float> && ncols_dst > 8) {
+        for (int first = 0; first < ncols_dst; first += 8) {
+            mul_mat_vec_f_cuda_switch_ncols_dst<T, type_acc>
+                (x, y + first*stride_col_y, ids, fusion, dst + first*stride_col_dst,
+                 ncols, nrows, std::min<int64_t>(8, ncols_dst - first), stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+        }
+        return;
+    }
+#endif
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path only - single-token goes through regular path below
@@ -802,6 +814,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
 
     switch (type) {
         case GGML_TYPE_F32:
+#ifdef GGML_CUDA_FORCE_MMQ
+            return true;
+#endif
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
